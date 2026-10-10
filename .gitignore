@@ -1,0 +1,16 @@
+# 빌드 결과
+*.o
+/bongbong.exe
+/bongvga.exe
+/BONG.EXE
+/BONGS.EXE
+
+# 실행하면 생기는 최고 점수
+/BONG.HI
+
+# 도구 부산물
+tools/__pycache__/
+tools/*.png
+
+# 배포 묶음 (release 폴더 자체는 저장소에 둔다)
+/release/bongbong.rar
