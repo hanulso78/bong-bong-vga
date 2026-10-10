@@ -1003,6 +1003,8 @@ static void vgm_poll(void)
     }
 }
 
+static void ts_poll(void);              /* 시험 모드 (아래) */
+
 /* ------------------------------------------------------- 가상 시계 ------ */
 static uclock_t clk_base = 0;
 
@@ -1044,6 +1046,7 @@ static void wait_until(uclock_t until)
 #endif
 
     while ((now = uclock()) < until) {
+        ts_poll();                      /* [원본에 없던 것] 시험 모드 */
         jingle_poll();                  /* [원본에 없던 것] 가락을 이어 간다 */
         slide_poll();                   /* [원본에 없던 것] 미끄러지는 소리 */
         vgm_poll();                     /* [원본에 없던 것] 애드립 곡을 이어 간다 */
@@ -1072,6 +1075,7 @@ void FrameSync(int fps)
     uclock_t step = UCLOCKS_PER_SEC / (fps > 0 ? fps : 70);
     uclock_t now;
 
+    ts_poll();                          /* [원본에 없던 것] 시험 모드 */
     jingle_poll();                      /* [원본에 없던 것] 가락을 이어 간다 */
     slide_poll();                       /* [원본에 없던 것] 미끄러지는 소리 */
     vgm_poll();                         /* [원본에 없던 것] 애드립 곡을 이어 간다 */
@@ -1090,6 +1094,100 @@ long TicksMs(void)
     return (long)(uclock() / (UCLOCKS_PER_SEC / 1000));
 }
 
+/* ------------------------------------------------- 시험 모드 (BBTEST) ---
+   [원본에 없던 것] 환경변수 BBTEST 에 대본 파일 이름을 주면, 대본에 적힌
+   시각(프로그램 시작 후 밀리초)에 키를 넣고, 화면을 BMP 로 저장하고, 끝낸다.
+   DOSBox 를 창 없이 돌려 화면을 찍을 때 쓴다 (tools/dosshot.py).
+
+       <ms> key <글자 또는 0x16진수>     0x100 이상이면 확장키 (0x148 = 위)
+       <ms> shot <이름>                  <이름>.BMP (8글자까지)
+       <ms> quit
+*/
+#define TS_MAX 64
+static struct { long ms; int op; int arg; char name[9]; } ts_cmd[TS_MAX];
+static int ts_n = 0, ts_i = 0, ts_loaded = 0;
+static int ts_key = -1;                     /* 넣을 차례가 된 키 */
+
+static void ts_load(void)
+{
+    const char *fn = getenv("BBTEST");
+    FILE *f;
+    char ln[80], w[16], a[16];
+    ts_loaded = 1;
+    if (!fn || !(f = fopen(fn, "r"))) return;
+    while (ts_n < TS_MAX && fgets(ln, sizeof ln, f)) {
+        long ms;
+        a[0] = 0;
+        if (sscanf(ln, "%ld %15s %15s", &ms, w, a) < 2) continue;
+        ts_cmd[ts_n].ms = ms;
+        if (!strcmp(w, "key")) {
+            ts_cmd[ts_n].op  = 1;
+            ts_cmd[ts_n].arg = (a[0] == '0' && a[1] == 'x') ? (int)strtol(a, NULL, 16)
+                             : (unsigned char)a[0];
+        } else if (!strcmp(w, "shot")) {
+            ts_cmd[ts_n].op = 2;
+            strncpy(ts_cmd[ts_n].name, a, 8);
+            ts_cmd[ts_n].name[8] = 0;
+        } else if (!strcmp(w, "quit")) {
+            ts_cmd[ts_n].op = 3;
+        } else continue;
+        ts_n++;
+    }
+    fclose(f);
+}
+
+static void ts_shot(const char *name)       /* 지금 화면을 8비트 BMP 로 */
+{
+    static unsigned char hdr[54], pal[1024], row[SCR_W];
+    char fn[16];
+    FILE *f;
+    int i, y;
+    unsigned long sz = 54 + 1024 + PAGE_BYTES;
+
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    hdr[2] = sz; hdr[3] = sz >> 8; hdr[4] = sz >> 16;
+    hdr[10] = (54 + 1024) & 0xFF; hdr[11] = (54 + 1024) >> 8;
+    hdr[14] = 40;
+    hdr[18] = SCR_W & 0xFF; hdr[19] = SCR_W >> 8;
+    hdr[22] = SCR_H;
+    hdr[26] = 1; hdr[28] = 8;
+    hdr[47] = 1;                            /* 색 256 개 */
+    outportb(0x3C7, 0);
+    for (i = 0; i < 256; i++) {
+        int r = inportb(0x3C9), g = inportb(0x3C9), b = inportb(0x3C9);
+        pal[i*4+0] = (b << 2) | (b >> 4);
+        pal[i*4+1] = (g << 2) | (g >> 4);
+        pal[i*4+2] = (r << 2) | (r >> 4);
+        pal[i*4+3] = 0;
+    }
+    sprintf(fn, "%s.BMP", name);
+    if (!(f = fopen(fn, "wb"))) return;
+    fwrite(hdr, 1, 54, f);
+    fwrite(pal, 1, 1024, f);
+    for (y = SCR_H - 1; y >= 0; y--) {      /* BMP 는 아래 줄부터 */
+        dosmemget(VGA_BASE + (unsigned long)y * SCR_W, SCR_W, row);
+        fwrite(row, 1, SCR_W, f);
+    }
+    fclose(f);
+}
+
+static void ts_poll(void)
+{
+    long now;
+    if (!ts_loaded) ts_load();
+    if (ts_i >= ts_n) return;
+    now = TicksMs();
+    while (ts_i < ts_n && ts_cmd[ts_i].ms <= now) {
+        switch (ts_cmd[ts_i].op) {
+        case 1: ts_key = ts_cmd[ts_i].arg; break;
+        case 2: ts_shot(ts_cmd[ts_i].name); break;
+        case 3: CloseGraph(); exit(0);
+        }
+        ts_i++;
+    }
+}
+
 /* Turbo Pascal ReadKey: 확장키는 0 을 먼저 주고, 다음 호출에서 스캔코드를 준다 */
 static int pending_scan = -1;
 
@@ -1101,6 +1199,8 @@ int KeyPressed(void)
 {
     __dpmi_regs r;
     if (pending_scan >= 0) return 1;
+    ts_poll();
+    if (ts_key >= 0) return 1;
     memset(&r, 0, sizeof r);
     r.h.ah = 0x11;                          /* 향상된 자판: 눌린 키가 있나 */
     __dpmi_int(0x16, &r);
@@ -1115,6 +1215,15 @@ char ReadKey(void)
         char c = (char)pending_scan;
         pending_scan = -1;
         return c;
+    }
+    if (ts_n > 0 || !ts_loaded) {           /* 시험 모드: 대본 키를 기다린다 */
+        while (!KeyPressed()) __dpmi_yield();
+        if (ts_key >= 0) {
+            int k = ts_key;
+            ts_key = -1;
+            if (k >= 0x100) { pending_scan = k & 0xFF; return 0; }
+            return (char)k;
+        }
     }
     memset(&r, 0, sizeof r);
     r.h.ah = 0x10;                          /* 향상된 자판: 키 하나 읽기 */
